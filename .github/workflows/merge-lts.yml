@@ -222,16 +222,19 @@ jobs:
             git add "$f"
             echo "Resolved $f"
           done
-          # complete cherry-pick/merge
+          # complete cherry-pick/merge - use pipefail to get real exit code
+          set -o pipefail
           if git cherry-pick --continue --no-edit 2>&1 | tee /tmp/continue.log; then
             echo "cherry-pick continue ok"
           elif git commit --no-edit 2>&1 | tee /tmp/commit.log; then
             echo "commit ok"
+          elif git merge --continue 2>&1 | tee /tmp/merge_continue.log; then
+            echo "merge continue ok"
           else
-            # try merge continue
-            git merge --continue 2>&1 || true
-            git commit --no-edit 2>&1 || true
+            echo "Trying final commit"
+            git commit --no-edit 2>&1 | tee /tmp/commit2.log || true
           fi
+          set +o pipefail
           git status | head -n 30
           git log --oneline -5 | head
 
@@ -244,9 +247,15 @@ jobs:
             git diff --stat HEAD~1..HEAD 2>&1 | head -n 50 || true
             exit 0
           fi
-          # verify no markers - check for actual conflict markers at line start, not printk strings like ">>>>>>>"
-          if grep -r "^<<<<<<< " --include="*.c" --include="*.h" --include="Makefile" . 2>/dev/null | head; then
+          # verify no markers - check real unmerged files and conflict markers at line start
+          if git ls-files --unmerged | grep -q .; then
+            echo "::error::still has unmerged files"
+            git ls-files --unmerged | head -n 20
+            exit 1
+          fi
+          if grep -rn "^<<<<<<< " --include="*.c" --include="*.h" --include="Makefile" . 2>/dev/null | tee /tmp/markers.log | head; then
             echo "::error::still has conflict markers"
+            cat /tmp/markers.log | head -n 20
             exit 1
           fi
           git push origin android12-5.10-stable || git push --force-with-lease origin android12-5.10-stable

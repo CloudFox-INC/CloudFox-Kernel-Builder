@@ -74,7 +74,8 @@ jobs:
             if [ "$cur" -gt "$max_depth" ]; then cur="$max_depth"; fi
             echo "No merge-base yet, deepening to $cur..."
             git fetch --deepen="$step" origin android12-5.10-stable 2>&1 | tail -n 5 || true
-            git fetch --deepen="$step" google android12-5.10-lts 2>&1 | tail -n 5 || true
+            # google googlesource is flaky HTTP 500, retry 3x
+            for i in 1 2 3; do git fetch --deepen="$step" google android12-5.10-lts 2>&1 | tail -n 5 && break || { echo "google fetch attempt $i failed, retrying..."; sleep 5; }; done || true
             echo "Shallow lines: $(wc -l < .git/shallow 2>/dev/null || echo 0)"
           done
           echo "Heads:"
@@ -151,9 +152,9 @@ jobs:
               continue
             fi
             content=$(cat "$f")
-            # limit size to 120k chars to fit context
-            content_trunc=$(echo "$content" | head -c 120000)
-            prompt="You are a kernel merge resolver. Resolve git merge conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. For version bumps (SUBLEVEL) take higher. For code, prefer Google LTS side if it adds safety checks (e.g. width>4096, skb_probe_transport_header). Keep both sides logically, remove markers, return ONLY file content, no markdown, no explanation.\n\nFile: $f\nContent:\n$content_trunc"
+            # limit size to 120k chars to fit context - use bash substring to avoid Broken pipe from echo|head
+            content_trunc=${content:0:120000}
+            prompt="You are a kernel merge resolver. FOCUS ON FOLLOWING LTS (google/android12-5.10-lts) - ALWAYS prefer LTS/theirs side. Resolve git merge conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. For version bumps (SUBLEVEL) take higher (LTS). For code, ALWAYS take LTS side if it adds safety checks (e.g. width>4096, skb_probe_transport_header). Remove markers, return ONLY file content, no markdown, no explanation.\n\nFile: $f\nContent:\n$content_trunc"
             # Use openrouter/free router with fallback to capable free models
             resp=$(curl -s https://openrouter.ai/api/v1/chat/completions \
               -H "Authorization: Bearer $OPENROUTER_API_KEY" \
@@ -179,7 +180,7 @@ jobs:
                 -d "{\"model\":\"qwen/qwen3-coder:free\",\"messages\":[{\"role\":\"user\",\"content\":$(jq -Rs . <<<"$prompt")}],\"temperature\":0.1}")
               resolved=$(echo "$resp2" | jq -r '.choices[0].message.content // empty')
             fi
-            if [ -z "$resolved" ] || echo "$resolved" | grep -q "<<<<<<<"; then
+            if [ -z "$resolved" ] || echo "$resolved" | grep -q "^<<<<<<< "; then
               echo "::warning::LLM failed to resolve $f cleanly, keeping markers"
               # fallback: take theirs (LTS) for these known files
               if echo "$f" | grep -qE "Makefile|amdgpu_uvd.c|af_packet.c"; then
@@ -202,9 +203,9 @@ jobs:
                 rm -f "$f.tmp"
               fi
             fi
-            # verify no markers remain
-            if grep -q "<<<<<<<" "$f"; then
-              echo "Still has markers, manual fallback to --theirs"
+            # verify no markers remain - check start of line, not printk
+            if grep -q "^<<<<<<< " "$f"; then
+              echo "Still has markers, manual fallback to --theirs (LTS)"
               git checkout --theirs "$f" || true
             fi
             git add "$f"
@@ -232,8 +233,8 @@ jobs:
             git diff --stat HEAD~1..HEAD 2>&1 | head -n 50 || true
             exit 0
           fi
-          # verify no markers
-          if grep -r "<<<<<<<" --include="*.c" --include="*.h" --include="Makefile" . 2>/dev/null | head; then
+          # verify no markers - check for actual conflict markers at line start, not printk strings like ">>>>>>>"
+          if grep -r "^<<<<<<< " --include="*.c" --include="*.h" --include="Makefile" . 2>/dev/null | head; then
             echo "::error::still has conflict markers"
             exit 1
           fi

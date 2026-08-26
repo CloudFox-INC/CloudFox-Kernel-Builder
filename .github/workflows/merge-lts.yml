@@ -181,9 +181,9 @@ jobs:
           }
           EOF
             )
-            echo "$resp" | head -c 2000
+            printf "%s\n" "${resp:0:2000}"
             # extract content, handle errors
-            resolved=$(echo "$resp" | jq -r '.choices[0].message.content // empty')
+            resolved=$(printf "%s" "$resp" | jq -r '.choices[0].message.content // empty' || true)
             if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
               echo "OpenRouter returned empty, trying fallback model qwen/qwen3-coder:free directly"
               resp2=$(curl -s https://openrouter.ai/api/v1/chat/completions \
@@ -247,15 +247,24 @@ jobs:
             git diff --stat HEAD~1..HEAD 2>&1 | head -n 50 || true
             exit 0
           fi
-          # verify no markers - check real unmerged files and conflict markers at line start
+          # verify no markers - check real unmerged files and conflict markers
           if git ls-files --unmerged | grep -q .; then
             echo "::error::still has unmerged files"
             git ls-files --unmerged | head -n 20
+            git status | head -n 30
             exit 1
           fi
-          if grep -rn "^<<<<<<< " --include="*.c" --include="*.h" --include="Makefile" . 2>/dev/null | tee /tmp/markers.log | head; then
+          # check for actual conflict markers (not printk) - use git diff check
+          if git diff --check 2>&1 | grep -q "conflict"; then
+            echo "::error::still has conflict markers via diff --check"
+            git diff --check 2>&1 | head -n 50
+            exit 1
+          fi
+          if grep -rn "^<<<<<<< " --include="*.c" --include="*.h" --include="Makefile" . 2>/dev/null > /tmp/markers.log 2>&1; then
             echo "::error::still has conflict markers"
-            cat /tmp/markers.log | head -n 20
+            cat /tmp/markers.log | head -n 50
+            # show which files
+            git diff --name-only --diff-filter=U | head -n 20 || true
             exit 1
           fi
           git push origin android12-5.10-stable || git push --force-with-lease origin android12-5.10-stable

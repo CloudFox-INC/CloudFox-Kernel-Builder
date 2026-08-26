@@ -1,0 +1,248 @@
+name: merge-lts
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "merge|cherry-pick (cherry-pick linearizes, merge preserves history)"
+        required: false
+        default: "cherry-pick"
+        type: choice
+        options: [merge, cherry-pick]
+      max_count:
+        description: "max commits to search for merge-base (auto deepens until found)"
+        required: false
+        default: "10000"
+      dry_run:
+        description: "dry run without push"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: merge-lts
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout CloudFox-Kernel
+        uses: actions/checkout@v5
+        with:
+          repository: CloudFox-INC/CloudFox-Kernel
+          ref: android12-5.10-stable
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Configure git (global identity)
+        run: |
+          git config user.name "CloudFox-INC"
+          git config user.email "CloudFox_INC@proton.me"
+          git config commit.gpgsign false
+          git config tag.gpgsign false
+          git config rerere.enabled true
+
+      - name: Add remotes and fetch deterministic (actual needed history)
+        run: |
+          max_depth="${{ inputs.max_count || 10000 }}"
+          # start small, deepen until merge-base found - deterministic, not fixed depth
+          init_depth=100
+          step=500
+          echo "max_depth=$max_depth init=$init_depth step=$step (max_count from input)"
+          git remote add google https://android.googlesource.com/kernel/common || git remote set-url google https://android.googlesource.com/kernel/common
+          git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git || git remote set-url stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git || true
+          echo "Fetching origin shallow init..."
+          git fetch --depth="$init_depth" origin android12-5.10-stable
+          echo "Fetching Google LTS shallow init..."
+          git fetch --depth="$init_depth" google android12-5.10-lts
+          git fetch --depth=100 stable linux-5.10.y || echo "stable fetch skipped"
+          # deterministically deepen until merge-base exists
+          cur="$init_depth"
+          while ! git merge-base HEAD google/android12-5.10-lts >/dev/null 2>&1; do
+            if [ "$cur" -ge "$max_depth" ]; then
+              echo "::warning::no merge-base within max_depth $max_depth, will use allow-unrelated/squash fallback"
+              break
+            fi
+            cur=$((cur + step))
+            if [ "$cur" -gt "$max_depth" ]; then cur="$max_depth"; fi
+            echo "No merge-base yet, deepening to $cur..."
+            git fetch --deepen="$step" origin android12-5.10-stable 2>&1 | tail -n 5 || true
+            git fetch --deepen="$step" google android12-5.10-lts 2>&1 | tail -n 5 || true
+            echo "Shallow lines: $(wc -l < .git/shallow 2>/dev/null || echo 0)"
+          done
+          echo "Heads:"
+          git log --oneline -3 HEAD
+          git log --oneline -3 google/android12-5.10-lts
+          echo "Merge-base:"
+          git merge-base HEAD google/android12-5.10-lts || echo "no merge-base (fallback)"
+          echo "Needed depth: $cur / $max_depth"
+          echo "Ahead/behind:"
+          echo "HEAD..google count: $(git rev-list --count HEAD..google/android12-5.10-lts 2>&1 || echo 0)"
+          echo "google..HEAD count: $(git rev-list --count google/android12-5.10-lts..HEAD 2>&1 || echo 0)"
+          echo "Shallow boundaries: $(wc -l < .git/shallow 2>/dev/null || echo 0)"
+
+      - name: Attempt merge/cherry-pick
+        id: merge
+        run: |
+          set +e
+          strategy="${{ inputs.strategy || 'cherry-pick' }}"
+          echo "strategy=$strategy"
+          if [ "$strategy" = "merge" ]; then
+            git merge --no-ff google/android12-5.10-lts -m "Merge android12-5.10-lts $(git rev-parse --short google/android12-5.10-lts) into android12-5.10-stable" 2>&1 | tee /tmp/merge.log
+            ec=${PIPESTATUS[0]}
+          else
+            # cherry-pick linearizes: 5.10.266 + reverts etc. Use -m 1 for merges
+            # Find merge-base if exists, else cherry-pick full range
+            base=$(git merge-base HEAD google/android12-5.10-lts 2>/dev/null || echo "")
+            if [ -n "$base" ]; then
+              echo "Cherry-picking $base..google/android12-5.10-lts"
+              git cherry-pick -m 1 "$base"..google/android12-5.10-lts 2>&1 | tee /tmp/merge.log
+              ec=${PIPESTATUS[0]}
+            else
+              # no base within shallow depth -> try direct diff as patch (squash-like)
+              echo "No merge-base in shallow window, falling back to squash diff"
+              git diff HEAD..google/android12-5.10-lts > /tmp/lts.diff
+              git apply --3way /tmp/lts.diff 2>&1 | tee /tmp/merge.log || true
+              ec=1
+            fi
+          fi
+          cat /tmp/merge.log
+          if grep -q "CONFLICT" /tmp/merge.log || git diff --name-only --diff-filter=U | grep -q .; then
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            echo "HAS_CONFLICT"
+            git status | head -n 50
+          else
+            if [ $ec -eq 0 ]; then
+              echo "conflict=false" >> $GITHUB_OUTPUT
+              echo "CLEAN"
+            else
+              echo "conflict=true" >> $GITHUB_OUTPUT
+              echo "FAILED with ec=$ec"
+            fi
+          fi
+
+      - name: Auto-resolve conflicts via OpenRouter (free)
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -e
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::error::OPENROUTER_API_KEY not set - cannot auto-resolve"
+            git cherry-pick --abort 2>/dev/null || git merge --abort 2>/dev/null || true
+            exit 1
+          fi
+          # install jq if needed
+          sudo apt-get update -qq && sudo apt-get install -y jq || true
+          for f in $(git diff --name-only --diff-filter=U); do
+            echo "=== Resolving $f ==="
+            # skip binary
+            if file "$f" | grep -q "binary"; then
+              echo "skip binary $f"
+              git checkout --theirs "$f" || true
+              git add "$f"
+              continue
+            fi
+            content=$(cat "$f")
+            # limit size to 120k chars to fit context
+            content_trunc=$(echo "$content" | head -c 120000)
+            prompt="You are a kernel merge resolver. Resolve git merge conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. For version bumps (SUBLEVEL) take higher. For code, prefer Google LTS side if it adds safety checks (e.g. width>4096, skb_probe_transport_header). Keep both sides logically, remove markers, return ONLY file content, no markdown, no explanation.\n\nFile: $f\nContent:\n$content_trunc"
+            # Use openrouter/free router with fallback to capable free models
+            resp=$(curl -s https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+              -H "Content-Type: application/json" \
+              -H "HTTP-Referer: https://github.com/CloudFox-INC/CloudFox-Kernel-Builder" \
+              -d @- <<EOF
+          {
+            "model": "openrouter/free",
+            "models": ["qwen/qwen3-coder:free", "deepseek/deepseek-r1:free", "meta-llama/llama-3.3-70b-instruct:free"],
+            "messages": [{"role": "user", "content": $(jq -Rs . <<<"$prompt")}],
+            "temperature": 0.1,
+            "max_tokens": 120000
+          }
+          EOF
+            )
+            echo "$resp" | head -c 2000
+            # extract content, handle errors
+            resolved=$(echo "$resp" | jq -r '.choices[0].message.content // empty')
+            if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
+              echo "OpenRouter returned empty, trying fallback model qwen/qwen3-coder:free directly"
+              resp2=$(curl -s https://openrouter.ai/api/v1/chat/completions \
+                -H "Authorization: Bearer $OPENROUTER_API_KEY" -H "Content-Type: application/json" \
+                -d "{\"model\":\"qwen/qwen3-coder:free\",\"messages\":[{\"role\":\"user\",\"content\":$(jq -Rs . <<<"$prompt")}],\"temperature\":0.1}")
+              resolved=$(echo "$resp2" | jq -r '.choices[0].message.content // empty')
+            fi
+            if [ -z "$resolved" ] || echo "$resolved" | grep -q "<<<<<<<"; then
+              echo "::warning::LLM failed to resolve $f cleanly, keeping markers"
+              # fallback: take theirs (LTS) for these known files
+              if echo "$f" | grep -qE "Makefile|amdgpu_uvd.c|af_packet.c"; then
+                if grep -q "SUBLEVEL" "$f"; then
+                  sed -i '/<<<<<<< HEAD/d;/=======/d;/>>>>>>>/d' "$f"
+                  # ensure SUBLEVEL 266 wins
+                  sed -i 's/SUBLEVEL = 265/SUBLEVEL = 266/' "$f" || true
+                else
+                  git checkout --theirs "$f" || true
+                fi
+              fi
+            else
+              # remove possible markdown fences
+              echo "$resolved" | sed -e 's/^```.*//g' -e 's/^```//g' > "$f.tmp"
+              # if file is smaller than 10 chars, ignore
+              if [ $(wc -c < "$f.tmp") -gt 50 ]; then
+                mv "$f.tmp" "$f"
+              else
+                echo "resolved too small, keeping original"
+                rm -f "$f.tmp"
+              fi
+            fi
+            # verify no markers remain
+            if grep -q "<<<<<<<" "$f"; then
+              echo "Still has markers, manual fallback to --theirs"
+              git checkout --theirs "$f" || true
+            fi
+            git add "$f"
+            echo "Resolved $f"
+          done
+          # complete cherry-pick/merge
+          if git cherry-pick --continue --no-edit 2>&1 | tee /tmp/continue.log; then
+            echo "cherry-pick continue ok"
+          elif git commit --no-edit 2>&1 | tee /tmp/commit.log; then
+            echo "commit ok"
+          else
+            # try merge continue
+            git merge --continue 2>&1 || true
+            git commit --no-edit 2>&1 || true
+          fi
+          git status | head -n 30
+          git log --oneline -5 | head
+
+      - name: Push
+        if: steps.merge.outputs.conflict == 'true' || steps.merge.outputs.conflict == 'false'
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run, not pushing"
+            git log --oneline -10 | head
+            git diff --stat HEAD~1..HEAD 2>&1 | head -n 50 || true
+            exit 0
+          fi
+          # verify no markers
+          if grep -r "<<<<<<<" --include="*.c" --include="*.h" --include="Makefile" . 2>/dev/null | head; then
+            echo "::error::still has conflict markers"
+            exit 1
+          fi
+          git push origin android12-5.10-stable || git push --force-with-lease origin android12-5.10-stable
+          echo "pushed $(git rev-parse --short HEAD)"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Head: $(git rev-parse --short HEAD)"
+          echo "Google LTS: $(git rev-parse --short google/android12-5.10-lts)"
+          echo "Diff files: $(git diff --name-only HEAD google/android12-5.10-lts 2>&1 | wc -l || echo 0)"

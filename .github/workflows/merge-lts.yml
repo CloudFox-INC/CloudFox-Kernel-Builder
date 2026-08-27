@@ -15,6 +15,10 @@ on:
         description: "max commits to search for merge-base (auto deepens until found)"
         required: false
         default: "10000"
+      revert_commit:
+        description: "revert to specific commit SHA (depth 1 fetch, force-with-lease, skips merge)"
+        required: false
+        default: ""
       dry_run:
         description: "dry run without push"
         required: false
@@ -50,7 +54,26 @@ jobs:
           git config tag.gpgsign false
           git config rerere.enabled true
 
+      - name: Revert to commit (depth 1, force-with-lease)
+        if: inputs.revert_commit != ''
+        run: |
+          set -e
+          commit="${{ inputs.revert_commit }}"
+          echo "Reverting to $commit with depth 1"
+          git fetch --depth=1 origin "$commit" 2>&1 | tail -n 5 || git fetch --depth=1 origin android12-5.10-stable 2>&1 | tail -n 5 || true
+          # try to checkout the commit directly (may need full fetch of that object)
+          git fetch --depth=1 origin "$commit" 2>&1 | tail -n 5 || true
+          git checkout --force "$commit" 2>&1 | tail -n 5 || git reset --hard "$commit" 2>&1 | tail -n 5 || { echo "::error::cannot checkout $commit"; exit 1; }
+          git log --oneline -3 | head
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run revert, not pushing"
+            exit 0
+          fi
+          git push --force-with-lease origin HEAD:android12-5.10-stable 2>&1 | tail -n 20
+          echo "reverted to $(git rev-parse --short HEAD)"
+
       - name: Add remotes and fetch deterministic (actual needed history, LTS + cloudfox only)
+        if: inputs.revert_commit == ''
         run: |
           max_depth="${{ inputs.max_count || 10000 }}"
           init_depth=100
@@ -100,6 +123,7 @@ jobs:
           # checkout faster: only LTS + cloudfox tree
 
       - name: Check if new LTS commits to merge
+        if: inputs.revert_commit == ''
         id: check
         run: |
           new=$(git rev-list --count HEAD..google/android12-5.10-lts 2>&1 || echo 0)
@@ -113,7 +137,7 @@ jobs:
           fi
 
       - name: Attempt merge/cherry-pick
-        if: steps.check.outputs.has_new == 'true'
+        if: inputs.revert_commit == '' && steps.check.outputs.has_new == 'true'
         id: merge
         run: |
           set +e
@@ -154,7 +178,7 @@ jobs:
           fi
 
       - name: Auto-resolve conflicts via OpenRouter (free)
-        if: steps.check.outputs.has_new == 'true' && steps.merge.outputs.conflict == 'true'
+        if: inputs.revert_commit == '' && steps.check.outputs.has_new == 'true' && steps.merge.outputs.conflict == 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
@@ -252,7 +276,7 @@ jobs:
           git log --oneline -5 | head
 
       - name: Push
-        if: steps.check.outputs.has_new == 'true' && (steps.merge.outputs.conflict == 'true' || steps.merge.outputs.conflict == 'false')
+        if: inputs.revert_commit == '' && steps.check.outputs.has_new == 'true' && (steps.merge.outputs.conflict == 'true' || steps.merge.outputs.conflict == 'false')
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "dry_run, not pushing"

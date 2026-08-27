@@ -192,6 +192,13 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y jq || true
           for f in $(git diff --name-only --diff-filter=U); do
             echo "=== Resolving $f ==="
+            # Makefile: never use LLM (it corrupts $(build)=scripts -> scripts/scripts) - take LTS directly
+            if [ "$f" = "Makefile" ]; then
+              echo "Makefile conflict - taking LTS/theirs directly to avoid LLM corruption"
+              git checkout --theirs "$f" || true
+              git add "$f"
+              continue
+            fi
             # skip binary
             if file "$f" | grep -q "binary"; then
               echo "skip binary $f"

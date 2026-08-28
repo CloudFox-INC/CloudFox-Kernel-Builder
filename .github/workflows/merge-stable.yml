@@ -21,6 +21,10 @@ on:
         description: "revert specific commit SHA by creating a revert commit (git revert -m 1 for merges, no force, preserves history)"
         required: false
         default: ""
+      ai_extra_prompt:
+        description: "additional AI prompt for proper backport (e.g. adapt timer_delete_sync to del_timer_sync for 5.10)"
+        required: false
+        default: ""
       dry_run:
         description: "dry run without push"
         required: false
@@ -299,7 +303,12 @@ jobs:
             content=$(cat "$f")
             # limit size to 120k chars to fit context - use bash substring to avoid Broken pipe from echo|head
             content_trunc=${content:0:120000}
-            prompt="You are a kernel merge resolver. FOCUS ON FOLLOWING STABLE (stable/linux-5.10.y) - ALWAYS prefer stable/theirs side. Resolve git merge conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. For version bumps (SUBLEVEL) take higher (stable). For code, ALWAYS take stable side if it adds safety checks (e.g. width>4096, skb_probe_transport_header). Remove markers, return ONLY file content, no markdown, no explanation.\n\nFile: $f\nContent:\n$content_trunc"
+            extra="${{ inputs.ai_extra_prompt }}"
+            if [ -n "$extra" ]; then
+              prompt="You are a kernel backport resolver. $extra FOCUS ON FOLLOWING STABLE (stable/linux-5.10.y) but do a proper backport for android12-5.10 - adapt APIs if needed (e.g. timer_delete_sync -> del_timer_sync, dmaengine_terminate_sync -> dmaengine_terminate_all with sync ordering), keep sync semantics, don't just take stable verbatim because it fits. Resolve git merge conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. For version bumps (SUBLEVEL) take higher (stable). Remove markers, return ONLY file content, no markdown, no explanation.\n\nFile: $f\nContent:\n$content_trunc"
+            else
+              prompt="You are a kernel merge resolver. FOCUS ON FOLLOWING STABLE (stable/linux-5.10.y) - ALWAYS prefer stable/theirs side. Resolve git merge conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. For version bumps (SUBLEVEL) take higher (stable). For code, ALWAYS take stable side if it adds safety checks (e.g. width>4096, skb_probe_transport_header). Remove markers, return ONLY file content, no markdown, no explanation.\n\nFile: $f\nContent:\n$content_trunc"
+            fi
             # Use minimax/m3 free primary, fallback to openrouter/free - safer prompt with system role
             resp=$(curl -s https://openrouter.ai/api/v1/chat/completions \
               -H "Authorization: Bearer $OPENROUTER_API_KEY" \

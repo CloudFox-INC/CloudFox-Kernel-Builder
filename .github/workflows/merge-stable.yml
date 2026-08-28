@@ -78,16 +78,24 @@ jobs:
         if: inputs.revert_commit == '' && inputs.revert_no_force_commit != ''
         run: |
           set -e
+          set -o pipefail
           commit="${{ inputs.revert_no_force_commit }}"
           echo "Creating revert commit for $commit (no force, preserves history)"
-          # cheap single-object fetch - try origin first, then stable mirrors (for gregkh/linux SHAs without deep history)
-          git fetch --depth=1 origin "$commit" 2>&1 | tail -n 5 || true
+          # cheap fetch needs commit + parents for revert to compute diff (depth 2, not 1)
+          git fetch --depth=2 origin "$commit" 2>&1 | tail -n 5 || true
           if ! git cat-file -e "$commit^{commit}" 2>/dev/null; then
-            echo "Not on origin, trying stable remotes (cheap, depth 1)..."
+            echo "Not on origin, trying stable remotes (cheap, depth 2)..."
             git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git 2>/dev/null || git remote set-url stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git 2>/dev/null || true
             git remote add stable-mirror https://github.com/gregkh/linux.git 2>/dev/null || git remote set-url stable-mirror https://github.com/gregkh/linux.git 2>/dev/null || true
-            git fetch --depth=1 stable "$commit" 2>&1 | tail -n 5 || true
-            git fetch --depth=1 stable-mirror "$commit" 2>&1 | tail -n 5 || true
+            git fetch --depth=2 stable "$commit" 2>&1 | tail -n 5 || true
+            git fetch --depth=2 stable-mirror "$commit" 2>&1 | tail -n 5 || true
+          fi
+          # ensure parent is present for revert (depth 2 should have it, but verify)
+          if ! git cat-file -e "$commit^" 2>/dev/null; then
+            echo "Parent not fetched, deepening by 1..."
+            git fetch --deepen=1 origin "$commit" 2>&1 | tail -n 5 || true
+            git fetch --deepen=1 stable "$commit" 2>&1 | tail -n 5 || true
+            git fetch --deepen=1 stable-mirror "$commit" 2>&1 | tail -n 5 || true
           fi
           git rev-parse --verify "$commit^{commit}" >/dev/null 2>&1 || { echo "::error::cannot find commit $commit (try full SHA, not short)"; exit 1; }
           git log --oneline -3 HEAD | head
@@ -96,14 +104,21 @@ jobs:
           parents=$(git rev-list --parents -n 1 "$commit" | wc -w)
           if [ "$parents" -gt 2 ]; then
             echo "Merge commit detected ($((parents-1)) parents), using -m 1"
-            git revert --no-edit -m 1 "$commit" 2>&1 | tail -n 20
+            git revert --no-edit -m 1 "$commit" 2>&1 | tee /tmp/revert.log
           else
-            git revert --no-edit "$commit" 2>&1 | tail -n 20
+            git revert --no-edit "$commit" 2>&1 | tee /tmp/revert.log
+          fi
+          # if revert had conflicts, abort and fail clearly (don't silently push no-op)
+          if grep -q "CONFLICT\|error: could not revert" /tmp/revert.log; then
+            echo "::error::revert conflict for $commit, see log above"
+            git revert --abort 2>/dev/null || true
+            cat /tmp/revert.log | tail -n 50
+            exit 1
           fi
           git log --oneline -3 | head
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "dry_run revert (no force), not pushing"
-            git revert --abort 2>/dev/null || git reset --hard HEAD~1 2>/dev/null || true
+            git reset --hard HEAD~1 2>/dev/null || true
             exit 0
           fi
           git push origin HEAD:android12-5.10-stable 2>&1 | tail -n 20

@@ -7,6 +7,10 @@ on:
         description: "comma-separated commit SHAs to cherry-pick in order (tries origin, then stable/google mirrors, depth 2 cheap)"
         required: true
         default: ""
+      ai_extra_prompt:
+        description: "additional AI prompt for proper backport (e.g. 'adapt timer_delete_sync to del_timer_sync for 5.10, keep sync semantics')"
+        required: false
+        default: ""
       dry_run:
         description: "dry run without push"
         required: false
@@ -108,7 +112,12 @@ jobs:
               fi
               content=$(cat "$f" 2>/dev/null || echo "")
               content_trunc=${content:0:120000}
-              prompt="You are a kernel cherry-pick resolver. Resolve git conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. Prefer the incoming cherry-picked commit side for the changed hunk, but keep surrounding context. Remove markers, return ONLY file content, no markdown.\n\nFile: $f Commit: $commit\nContent:\n$content_trunc"
+              extra="${{ inputs.ai_extra_prompt }}"
+              if [ -n "$extra" ]; then
+                prompt="You are a kernel backport resolver. $extra Resolve git conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. Do a proper backport for the target tree (android12-5.10) - adapt APIs if needed (e.g. timer_delete_sync -> del_timer_sync, dmaengine_terminate_sync -> dmaengine_terminate_all with correct ordering), keep sync semantics and fix ordering, don't just take the incoming side verbatim because it fits. Remove markers, return ONLY file content, no markdown.\n\nFile: $f Commit: $commit\nContent:\n$content_trunc"
+              else
+                prompt="You are a kernel cherry-pick resolver. Resolve git conflict markers <<<<<<< HEAD, =======, >>>>>>> in this file. Prefer the incoming cherry-picked commit side for the changed hunk, but keep surrounding context. Remove markers, return ONLY file content, no markdown.\n\nFile: $f Commit: $commit\nContent:\n$content_trunc"
+              fi
               resp=$(curl -s https://openrouter.ai/api/v1/chat/completions \
                 -H "Authorization: Bearer $OPENROUTER_API_KEY" \
                 -H "Content-Type: application/json" \

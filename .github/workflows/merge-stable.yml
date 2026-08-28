@@ -17,6 +17,10 @@ on:
         description: "revert to specific commit SHA (depth 1 fetch, force-with-lease, skips merge)"
         required: false
         default: ""
+      revert_no_force_commit:
+        description: "revert specific commit SHA by creating a revert commit (git revert -m 1 for merges, no force, preserves history)"
+        required: false
+        default: ""
       dry_run:
         description: "dry run without push"
         required: false
@@ -70,8 +74,43 @@ jobs:
           git push --force-with-lease origin HEAD:android12-5.10-stable 2>&1 | tail -n 20
           echo "reverted to $(git rev-parse --short HEAD)"
 
+      - name: Revert commit (create revert commit, no force, preserves history)
+        if: inputs.revert_commit == '' && inputs.revert_no_force_commit != ''
+        run: |
+          set -e
+          commit="${{ inputs.revert_no_force_commit }}"
+          echo "Creating revert commit for $commit (no force, preserves history)"
+          # cheap single-object fetch - try origin first, then stable mirrors (for gregkh/linux SHAs without deep history)
+          git fetch --depth=1 origin "$commit" 2>&1 | tail -n 5 || true
+          if ! git cat-file -e "$commit^{commit}" 2>/dev/null; then
+            echo "Not on origin, trying stable remotes (cheap, depth 1)..."
+            git remote add stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git 2>/dev/null || git remote set-url stable https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git 2>/dev/null || true
+            git remote add stable-mirror https://github.com/gregkh/linux.git 2>/dev/null || git remote set-url stable-mirror https://github.com/gregkh/linux.git 2>/dev/null || true
+            git fetch --depth=1 stable "$commit" 2>&1 | tail -n 5 || true
+            git fetch --depth=1 stable-mirror "$commit" 2>&1 | tail -n 5 || true
+          fi
+          git rev-parse --verify "$commit^{commit}" >/dev/null 2>&1 || { echo "::error::cannot find commit $commit (try full SHA, not short)"; exit 1; }
+          git log --oneline -3 HEAD | head
+          echo "Target: $(git log --oneline -1 "$commit" | head)"
+          # detect merge commit (more than one parent)
+          parents=$(git rev-list --parents -n 1 "$commit" | wc -w)
+          if [ "$parents" -gt 2 ]; then
+            echo "Merge commit detected ($((parents-1)) parents), using -m 1"
+            git revert --no-edit -m 1 "$commit" 2>&1 | tail -n 20
+          else
+            git revert --no-edit "$commit" 2>&1 | tail -n 20
+          fi
+          git log --oneline -3 | head
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry_run revert (no force), not pushing"
+            git revert --abort 2>/dev/null || git reset --hard HEAD~1 2>/dev/null || true
+            exit 0
+          fi
+          git push origin HEAD:android12-5.10-stable 2>&1 | tail -n 20
+          echo "reverted $commit via revert commit $(git rev-parse --short HEAD) (no force)"
+
       - name: Add remotes and fetch deterministic (actual needed history, stable + cloudfox only)
-        if: inputs.revert_commit == ''
+        if: inputs.revert_commit == '' && inputs.revert_no_force_commit == ''
         run: |
           max_depth="${{ inputs.max_count || 10000 }}"
           init_depth=100
@@ -159,7 +198,7 @@ jobs:
           # checkout faster: only stable + cloudfox tree
 
       - name: Check if new stable commits to merge
-        if: inputs.revert_commit == ''
+        if: inputs.revert_commit == '' && inputs.revert_no_force_commit == ''
         id: check
         run: |
           new=$(git rev-list --count HEAD..stable/linux-5.10.y 2>&1 || echo 0)
@@ -173,7 +212,7 @@ jobs:
           fi
 
       - name: Attempt merge/cherry-pick
-        if: inputs.revert_commit == '' && steps.check.outputs.has_new == 'true'
+        if: inputs.revert_commit == '' && inputs.revert_no_force_commit == '' && steps.check.outputs.has_new == 'true'
         id: merge
         run: |
           set +e
@@ -214,7 +253,7 @@ jobs:
           fi
 
       - name: Auto-resolve conflicts via OpenRouter (free)
-        if: inputs.revert_commit == '' && steps.check.outputs.has_new == 'true' && steps.merge.outputs.conflict == 'true'
+        if: inputs.revert_commit == '' && inputs.revert_no_force_commit == '' && steps.check.outputs.has_new == 'true' && steps.merge.outputs.conflict == 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
@@ -319,7 +358,7 @@ jobs:
           git log --oneline -5 | head
 
       - name: Push
-        if: inputs.revert_commit == '' && steps.check.outputs.has_new == 'true' && (steps.merge.outputs.conflict == 'true' || steps.merge.outputs.conflict == 'false')
+        if: inputs.revert_commit == '' && inputs.revert_no_force_commit == '' && steps.check.outputs.has_new == 'true' && (steps.merge.outputs.conflict == 'true' || steps.merge.outputs.conflict == 'false')
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "dry_run, not pushing"
